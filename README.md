@@ -13,7 +13,7 @@
 | Token 鉴权 | Access Key / Secret Key 换取短期 Token，支持自动刷新 |
 | ASR | 麦克风录音 → 上传 PCM → 识别文本 |
 | TTS | 文本合成 → PCM 音频 → 耳机/扬声器播放 |
-| 语音对话 | `voice_chat.py`：麦克风说话 → 识别 → 本地逻辑回复 → 语音播放 |
+| 语音对话 | `voice_chat.py`：麦克风说话 → 识别 → 本地逻辑回复 → 语音播放（**默认流式**） |
 
 ---
 
@@ -154,48 +154,52 @@ python examples/asr_demo.py test_input.pcm
 
 ### 3. 语音对话（推荐）
 
-Windows 推荐使用启动脚本（避免 `python` 命令指向应用商店占位程序）：
+提供 **流式**（默认）和 **批处理** 两种模式：
+
+| 模式 | 命令 | ASR | TTS | 适用场景 |
+|------|------|-----|-----|----------|
+| **流式**（推荐） | `.\run_voice_chat.bat` | 边录边传，实时显示识别中间结果 | 边收边播，首包即出声 | 日常对话、低延迟 |
+| **批处理** | `.\run_voice_chat.bat --batch` | 录完再上传识别 | 收齐音频再播放 | 调试、对比测试 |
 
 ```powershell
+# 流式（默认）
 .\run_voice_chat.bat
+
+# 批处理
+.\run_voice_chat.bat --batch
+
+# 指定麦克风/耳机
+.\run_voice_chat.bat --list-devices
+.\run_voice_chat.bat --input 1 --output 4
 ```
 
-或：
+**流式模式特点：**
 
-```powershell
-python voice_chat.py
-```
+- 麦克风每 120ms 即上传一帧，无需等录完
+- 终端实时显示 `识别中: xxx` 中间结果
+- TTS 收到首包立即播放，显示 `TTS 首包 xxx ms`
 
 **使用方式：**
 
 1. 按 **Enter** 开始录音（不是按住 Enter）
 2. 对着麦克风说话，说完停顿约 **1 秒** 自动结束
-3. 等待 ASR 识别 → 机器人回复 → 耳机播放
+3. 等待识别 → 机器人回复 → 耳机播放
 4. 说「退出」「再见」结束对话
-
-**指定麦克风/耳机设备：**
-
-```powershell
-.\run_voice_chat.bat --list-devices
-.\run_voice_chat.bat --input 1 --output 4
-```
 
 ### 4. 延迟测试
 
-运行基准脚本，测量 Token、WebSocket、ASR、TTS 各阶段耗时：
+运行基准脚本，支持 **批处理 / 流式对比**：
 
 ```powershell
-# 完整测试
-python examples/latency_benchmark.py
+# 对比两种模式（推荐，主要测 TTS 感知延迟）
+python examples/latency_benchmark.py --compare --rounds 2 --skip-asr
 
-# 多轮取平均
-python examples/latency_benchmark.py --rounds 3
+# 含 ASR 的完整对比（需真人语音 PCM）
+python examples/latency_benchmark.py --compare --rounds 2 --pcm test_input.pcm
 
-# 用真人语音 PCM 测 ASR（推荐）
-python examples/latency_benchmark.py --pcm test_input.pcm
-
-# 只测 TTS
-python examples/latency_benchmark.py --skip-asr
+# 单独测某一种模式
+python examples/latency_benchmark.py --mode streaming --rounds 3
+python examples/latency_benchmark.py --mode batch --rounds 3
 ```
 
 **测量指标：**
@@ -205,30 +209,34 @@ python examples/latency_benchmark.py --skip-asr
 | Token 获取（冷/缓存） | 鉴权 HTTP 请求耗时 |
 | WebSocket 连接 | 建立语音通道耗时 |
 | PCM 音频配置 | 请求 TTS 下行 PCM 格式耗时 |
-| ASR 上传 | 按实时节奏发送音频（约等于录音时长） |
-| ASR 识别 | 上传完成 → 收到 `IS_FINAL` 识别结果 |
+| ASR 上传 | 音频上传耗时 |
+| ASR 识别 | 上传完成 → 收到 `IS_FINAL` |
 | TTS 首包 (TTFB) | 发起合成 → 收到第一段音频 |
-| TTS 完成 | 发起合成 → 全部音频收完 |
+| TTS 全部收完 | 发起合成 → 全部音频收完 |
+| **TTS 感知延迟** | 流式=首包；批处理=全部收完 |
+| **对话感知延迟** | ASR 完成 → 开始听到回复 |
 
-**参考延迟（国内网络，仅供参考，实际因网络和设备而异）：**
+**实测对比（2026-07，国内网络，TTS 约 3s 语音）：**
 
-| 指标 | 典型范围 |
-|------|----------|
-| Token 获取（冷启动） | 1.5–2.5 s |
-| WebSocket 连接 | 1.0–2.5 s |
-| PCM 配置 | 300–500 ms |
-| TTS 首包 (TTFB) | 500–800 ms |
-| TTS 完成（约 3s 语音） | 2.0–2.5 s |
-| ASR 识别（上传完成后） | 300–800 ms |
+| 指标 | 批处理 | 流式 | 差异 |
+|------|--------|------|------|
+| TTS 首包 (TTFB) | ~660 ms | ~646 ms | 网络侧相近 |
+| **TTS 感知延迟** | **~1606 ms** | **~646 ms** | **流式快约 1 秒** |
+| WebSocket 连接 | ~1–4 s | ~1–4 s | 首次连接占比较大 |
 
-**估算一轮对话延迟（不含录音和本地播放）：**
+> TTS 首包时间两种模式相同；流式的优势在于**不必等全部收完才开始播放**，用户感知延迟约等于首包时间。
+
+**估算一轮对话感知延迟：**
 
 ```
-用户说完 → ASR 识别完成 → TTS 首包出声
-≈ ASR上传(≈录音时长) + ASR识别 + TTS首包
+流式:   说话中(ASR边录边传) → ASR识别完成 → TTS首包出声
+批处理: 说话 → 录完 → 上传识别 → 等TTS全部收完 → 播放
+
+流式对话感知 ≈ ASR识别 + TTS首包
+批处理对话感知 ≈ 录音时长 + ASR识别 + TTS全部收完
 ```
 
-> ASR 测试需使用**真人说话的 PCM**（时长 > 1.5s）。用 TTS 合成音测 ASR 会超时或无结果。
+> ASR 对比测试请用**真人说话的 PCM**（`test_input.pcm`，时长 > 1.5s）。
 
 ---
 
@@ -268,7 +276,42 @@ play_pcm(audio)
 speech.close()
 ```
 
-完整示例见 `robot_demo.py`，实时麦克风对话见 `voice_chat.py`。
+完整示例见 `robot_demo.py`，实时麦克风对话见 `voice_chat.py`（默认流式）。
+
+**流式集成示例：**
+
+```python
+from joyinside.speech import JoyInsideSpeech
+from joyinside.local_audio import StreamingPcmPlayer
+
+speech.ensure_pcm_output()
+player = StreamingPcmPlayer()
+player.start()
+
+def on_tts_audio(data, meta):
+    player.feed(data)
+
+def on_tts_complete():
+    player.finish()
+
+speech.on_tts_audio = on_tts_audio
+speech.on_tts_complete = on_tts_complete
+speech.speak("你好")
+```
+
+**流式 ASR 集成示例：**
+
+```python
+speech.begin_asr()
+
+def on_mic_chunk(chunk: bytes, is_last: bool):
+    if chunk:
+        speech.stream_asr_chunk(chunk, is_last=is_last)
+    if is_last:
+        speech.finish_asr()
+
+# 在麦克风回调中调用 on_mic_chunk
+```
 
 ---
 

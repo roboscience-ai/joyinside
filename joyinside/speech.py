@@ -26,6 +26,7 @@ from joyinside.audio import frame_duration_seconds
 logger = logging.getLogger(__name__)
 
 OnAsrFinal = Callable[[str], None]
+OnAsrPartial = Callable[[str], None]
 OnTtsAudio = Callable[[bytes, dict[str, Any]], None]
 OnTtsComplete = Callable[[], None]
 OnError = Callable[[Exception], None]
@@ -39,6 +40,7 @@ class JoyInsideSpeech:
     ping_interval: float = 30.0
     uid: str = ""
     on_asr_final: OnAsrFinal | None = None
+    on_asr_partial: OnAsrPartial | None = None
     on_tts_audio: OnTtsAudio | None = None
     on_tts_complete: OnTtsComplete | None = None
     on_error: OnError | None = None
@@ -50,6 +52,7 @@ class JoyInsideSpeech:
     _config_ready: threading.Event = field(default_factory=threading.Event, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _asr_mode: bool = field(default=False, init=False)
+    _asr_frame_index: int = field(default=0, init=False)
     _stop_ping: threading.Event = field(default_factory=threading.Event, init=False)
 
     def connect(self, timeout: float = 15.0) -> None:
@@ -153,6 +156,29 @@ class JoyInsideSpeech:
             {"text": text},
         )
 
+    def begin_asr(self) -> None:
+        """开始流式 ASR 会话。"""
+        self._asr_mode = True
+        self._asr_frame_index = 0
+
+    def stream_asr_chunk(self, chunk: bytes, *, is_last: bool = False) -> None:
+        """流式上传单帧 ASR 音频（边录边传，无需额外 sleep）。"""
+        from config import BYTES_PER_FRAME
+
+        if not chunk:
+            return
+        frame_size = BYTES_PER_FRAME
+        index = self._asr_frame_index
+        is_partial_last = is_last and len(chunk) < frame_size
+        send_index = ~index if is_partial_last else index
+        self._send_audio(chunk, index=send_index)
+        self._asr_frame_index += 1
+
+    def finish_asr(self) -> None:
+        """结束流式 ASR 上传。"""
+        if self.manual_mode:
+            self._send_event("CLIENT_AUDIO_FINISH")
+
     def recognize_pcm(self, pcm_chunks: list[bytes], *, frame_bytes: int | None = None) -> None:
         """上传 PCM 帧进行 ASR（手动模式需配合 CLIENT_AUDIO_FINISH）。"""
         from config import BYTES_PER_FRAME
@@ -242,8 +268,11 @@ class JoyInsideSpeech:
             text = content.get("text", "")
             text_type = content.get("textType", "")
             logger.info("ASR [%s]: %s", text_type, text)
-            if text_type == "IS_FINAL" and self.on_asr_final:
-                self.on_asr_final(text)
+            if text_type == "IS_FINAL":
+                if self.on_asr_final:
+                    self.on_asr_final(text)
+            elif text and self.on_asr_partial:
+                self.on_asr_partial(text)
             if (
                 text_type == "IS_FINAL"
                 and self._asr_mode
