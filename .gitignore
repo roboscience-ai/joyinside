@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pcm
+*.wav
+output_tts.pcm
+robot_reply.pcm
+debug_tts.pcm
+debug_pcm.pcm
+.venv/
+venv/
