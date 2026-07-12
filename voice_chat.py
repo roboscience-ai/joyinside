@@ -1,10 +1,10 @@
 """
-语音对话：流式 ASR（边录边传）+ 流式 TTS（边收边播）。
+语音对话：默认使用 JoyInside 平台智能体（ASR → 智能体 → TTS）。
 
 用法:
-  python voice_chat.py                  # 流式模式（默认）
-  python voice_chat.py --batch          # 批处理模式（录完再传、收完再播）
-  python voice_chat.py --list-devices   # 列出音频设备
+  python voice_chat.py                  # JoyInside 智能体（默认）
+  python voice_chat.py --local          # 本地大脑 + 纯 TTS（旧模式）
+  python voice_chat.py --list-devices
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import logging
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import sounddevice as sd
@@ -21,14 +22,12 @@ import sounddevice as sd
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from config import BYTES_PER_FRAME, SAMPLE_RATE, JoyInsideConfig
+from config import BYTES_PER_FRAME, JoyInsideConfig
 from joyinside import JoyInsideAuth
-from joyinside.audio import chunk_pcm
+from joyinside.brain import ConversationBrain
 from joyinside.local_audio import (
     StreamingPcmPlayer,
     list_audio_devices,
-    play_pcm,
-    record_until_silence,
     stream_record_until_silence,
 )
 from joyinside.speech import JoyInsideSpeech, SyncSpeechHelper
@@ -48,36 +47,17 @@ def parse_device(value: str | None) -> int | str | None:
         return value
 
 
-def robot_brain(user_text: str) -> str:
-    """简单回复逻辑，可替换成自己的 LLM。"""
-    text = user_text.strip().lstrip("，, ")
-    if not text:
-        return "我没有听清楚，请再说一遍。"
-    lower = text.lower()
-    if any(word in lower for word in ("你好", "您好", "hello", "hi")):
-        return "你好，我是语音助手，有什么可以帮你的？"
-    if "天气" in text:
-        return "我暂时查不了天气，你可以问我其他问题。"
-    if "名字" in text or "叫什么" in text:
-        return "我是 JoyInside 语音机器人，很高兴和你聊天。"
-    if "谢谢" in text:
-        return "不客气，还有什么想说的吗？"
-    return f"我听到你说：{text}。这是一个演示回复，你可以把 robot_brain 换成自己的大模型。"
-
-
 def print_audio_devices(input_device: int | str | None, output_device: int | str | None) -> None:
     try:
         if input_device is None:
             in_idx = sd.default.device[0]
-            in_name = sd.query_devices(in_idx)["name"]
-            print(f"麦克风: [{in_idx}] {in_name}", flush=True)
+            print(f"麦克风: [{in_idx}] {sd.query_devices(in_idx)['name']}", flush=True)
         else:
             print(f"麦克风: 设备 {input_device}", flush=True)
 
         if output_device is None:
             out_idx = sd.default.device[1]
-            out_name = sd.query_devices(out_idx)["name"]
-            print(f"播放设备: [{out_idx}] {out_name}", flush=True)
+            print(f"播放设备: [{out_idx}] {sd.query_devices(out_idx)['name']}", flush=True)
             print("若听不到声音，请用 --list-devices 查看编号，并用 --output 指定耳机", flush=True)
         else:
             print(f"播放设备: 设备 {output_device}", flush=True)
@@ -85,13 +65,117 @@ def print_audio_devices(input_device: int | str | None, output_device: int | str
         print(f"无法查询音频设备: {exc}", flush=True)
 
 
-def recognize_streaming(
+def _is_mp3(data: bytes) -> bool:
+    return bool(
+        data
+        and (
+            data[:3] == b"ID3"
+            or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")
+        )
+    )
+
+
+def agent_turn(
     speech: JoyInsideSpeech,
     *,
     input_device: int | str | None,
+    output_device: int | str | None,
     silence_threshold: float,
-) -> str:
-    """流式 ASR：边录边传，显示中间识别结果。"""
+    timeout: float = 90.0,
+) -> tuple[str, str]:
+    """
+    一轮 JoyInside 智能体对话：边录边传 → 平台 ASR+智能体+TTS → 边收边播。
+
+    返回 (用户文本, 智能体回复文本)。
+    """
+    user_text = ""
+    agent_chunks: list[str] = []
+    asr_done = threading.Event()
+    reply_done = threading.Event()
+    player = StreamingPcmPlayer(device=output_device)
+    player.start()
+    first_audio_at = 0.0
+    t0 = time.perf_counter()
+
+    def on_partial(text: str) -> None:
+        if text:
+            print(f"\r  识别中: {text}", end="", flush=True)
+
+    def on_final(text: str) -> None:
+        nonlocal user_text
+        user_text = text.strip()
+        asr_done.set()
+
+    def on_agent(text: str, _meta: dict) -> None:
+        agent_chunks.append(text)
+
+    def on_tts_audio(data: bytes, _meta: dict) -> None:
+        nonlocal first_audio_at
+        if not data or _is_mp3(data):
+            return
+        if first_audio_at == 0.0:
+            first_audio_at = time.perf_counter()
+            print(f"\n  智能体首包 {(first_audio_at - t0) * 1000:.0f}ms", flush=True)
+        player.feed(data)
+
+    def on_tts_complete() -> None:
+        reply_done.set()
+
+    prev = (
+        speech.on_asr_partial,
+        speech.on_asr_final,
+        speech.on_agent,
+        speech.on_tts_audio,
+        speech.on_tts_complete,
+    )
+    speech.on_asr_partial = on_partial
+    speech.on_asr_final = on_final
+    speech.on_agent = on_agent
+    speech.on_tts_audio = on_tts_audio
+    speech.on_tts_complete = on_tts_complete
+    speech.begin_asr()
+
+    def on_chunk(chunk: bytes, is_last: bool) -> None:
+        if chunk:
+            speech.stream_asr_chunk(chunk, is_last=is_last)
+        if is_last:
+            speech.finish_asr()
+
+    try:
+        recorded = stream_record_until_silence(
+            on_chunk,
+            device=input_device,
+            silence_threshold=silence_threshold,
+        )
+        if len(recorded.pcm) < BYTES_PER_FRAME:
+            return "", ""
+
+        if not reply_done.wait(timeout):
+            raise TimeoutError("智能体回复超时")
+
+        player.finish()
+        agent_reply = "".join(agent_chunks).strip()
+        return user_text, agent_reply
+    finally:
+        (
+            speech.on_asr_partial,
+            speech.on_asr_final,
+            speech.on_agent,
+            speech.on_tts_audio,
+            speech.on_tts_complete,
+        ) = prev
+
+
+def local_turn_streaming(
+    speech: JoyInsideSpeech,
+    helper: SyncSpeechHelper,
+    brain: ConversationBrain,
+    *,
+    input_device: int | str | None,
+    output_device: int | str | None,
+    silence_threshold: float,
+) -> tuple[str, str]:
+    """本地大脑模式（旧）。"""
     result: dict[str, str] = {}
     asr_done = threading.Event()
 
@@ -100,13 +184,11 @@ def recognize_streaming(
             print(f"\r  识别中: {text}", end="", flush=True)
 
     def on_final(text: str) -> None:
-        result["text"] = text
+        result["user"] = text
         asr_done.set()
 
-    prev_partial = speech.on_asr_partial
-    prev_final = speech.on_asr_final
-    speech.on_asr_partial = on_partial
-    speech.on_asr_final = on_final
+    prev_partial, prev_final = speech.on_asr_partial, speech.on_asr_final
+    speech.on_asr_partial, speech.on_asr_final = on_partial, on_final
     speech.begin_asr()
 
     def on_chunk(chunk: bytes, is_last: bool) -> None:
@@ -123,100 +205,37 @@ def recognize_streaming(
         )
         print(flush=True)
         if len(recorded.pcm) < BYTES_PER_FRAME:
-            return ""
+            return "", ""
         if not asr_done.wait(30.0):
             raise TimeoutError("ASR 超时")
-        return result.get("text", "").strip()
+        user_text = result.get("user", "").strip()
+        reply = brain.reply(user_text)
+
+        speech.ensure_pcm_output()
+        player = StreamingPcmPlayer(device=output_device)
+        player.start()
+        done = threading.Event()
+
+        def on_audio(data: bytes, _meta: dict) -> None:
+            if data and not _is_mp3(data):
+                player.feed(data)
+
+        def on_complete() -> None:
+            done.set()
+
+        prev_a, prev_c = speech.on_tts_audio, speech.on_tts_complete
+        speech.on_tts_audio, speech.on_tts_complete = on_audio, on_complete
+        try:
+            speech.speak(reply)
+            if not done.wait(60.0):
+                raise TimeoutError("TTS 超时")
+            player.finish()
+        finally:
+            speech.on_tts_audio, speech.on_tts_complete = prev_a, prev_c
+
+        return user_text, reply
     finally:
-        speech.on_asr_partial = prev_partial
-        speech.on_asr_final = prev_final
-
-
-def recognize_batch(
-    helper: SyncSpeechHelper,
-    *,
-    input_device: int | str | None,
-    silence_threshold: float,
-) -> str:
-    """批处理 ASR：录完再传。"""
-    recorded = record_until_silence(
-        device=input_device,
-        silence_threshold=silence_threshold,
-    )
-    if len(recorded.pcm) < BYTES_PER_FRAME:
-        return ""
-    print(f"录音 {recorded.duration_s:.1f}s，正在识别…")
-    return helper.recognize_and_wait(chunk_pcm(recorded.pcm), timeout=30.0).strip()
-
-
-def speak_streaming(
-    speech: JoyInsideSpeech,
-    text: str,
-    *,
-    output_device: int | str | None,
-    timeout: float = 60.0,
-) -> None:
-    """流式 TTS：边收边播。"""
-    speech.ensure_pcm_output()
-    player = StreamingPcmPlayer(device=output_device)
-    player.start()
-    done = threading.Event()
-    first_at = 0.0
-    t0 = time.perf_counter()
-
-    def on_audio(data: bytes, meta: dict) -> None:
-        nonlocal first_at
-        if not data:
-            return
-        if data[:3] == b"ID3" or data[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
-            print("警告: TTS 返回 MP3 而非 PCM", flush=True)
-            return
-        if first_at == 0.0:
-            first_at = time.perf_counter()
-            print(f"  TTS 首包 {(first_at - t0) * 1000:.0f}ms", flush=True)
-        player.feed(data)
-
-    def on_complete() -> None:
-        done.set()
-
-    prev_audio = speech.on_tts_audio
-    prev_complete = speech.on_tts_complete
-    speech.on_tts_audio = on_audio
-    speech.on_tts_complete = on_complete
-
-    try:
-        speech.speak(text)
-        if not done.wait(timeout):
-            raise TimeoutError("TTS 超时")
-        player.finish()
-        total_ms = (time.perf_counter() - t0) * 1000
-        print(f"  TTS 完成 {total_ms:.0f}ms", flush=True)
-    finally:
-        speech.on_tts_audio = prev_audio
-        speech.on_tts_complete = prev_complete
-
-
-def speak_batch(
-    speech: JoyInsideSpeech,
-    helper: SyncSpeechHelper,
-    text: str,
-    *,
-    output_device: int | str | None,
-    timeout: float = 60.0,
-) -> None:
-    """批处理 TTS：收齐再播。"""
-    speech.ensure_pcm_output()
-    audio = helper.speak_and_collect(text, timeout=timeout)
-    if not audio:
-        print("警告: TTS 未返回音频数据", flush=True)
-        return
-    if audio[:3] == b"ID3" or audio[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
-        print("警告: TTS 返回 MP3 而非 PCM", flush=True)
-        return
-    duration_s = len(audio) / (SAMPLE_RATE * 2)
-    print(f"收到音频 {len(audio)} 字节（约 {duration_s:.1f}s），正在播放…", flush=True)
-    play_pcm(audio, device=output_device)
-    print("播放完成", flush=True)
+        speech.on_asr_partial, speech.on_asr_final = prev_partial, prev_final
 
 
 def run_chat(
@@ -224,35 +243,40 @@ def run_chat(
     input_device: int | str | None,
     output_device: int | str | None,
     silence_threshold: float,
-    streaming: bool,
+    use_agent: bool,
 ) -> None:
-    mode = "流式" if streaming else "批处理"
+    mode_name = "JoyInside 智能体" if use_agent else "本地大脑"
     print("=" * 50, flush=True)
-    print(f"语音对话启动中（{mode} ASR + TTS）", flush=True)
+    print(f"语音对话启动中（{mode_name}）", flush=True)
     print("按 Enter 开始说话，说完停顿约 1 秒会自动结束录音", flush=True)
-    if streaming:
-        print("流式模式：边录边识别、边合成边播放", flush=True)
+    if use_agent:
+        print("对话由 JoyInside 控制台人设/技能驱动，请在平台配置智能体", flush=True)
     print("说「退出」「再见」结束对话，Ctrl+C 强制退出", flush=True)
     print("=" * 50, flush=True)
 
     cfg = JoyInsideConfig.from_env()
     auth = JoyInsideAuth(cfg.access_key, cfg.secret_key)
+    session_id = str(uuid.uuid4())
 
     def get_token() -> str:
         return auth.get_token(bot_id=cfg.bot_id)
 
     print("正在连接 JoyInside…", flush=True)
-    speech = JoyInsideSpeech(bot_id=cfg.bot_id, get_token=get_token)
-    speech.connect()
-    helper = SyncSpeechHelper(speech)
-    print("连接成功，可以开始对话。", flush=True)
-    print_audio_devices(input_device, output_device)
+    speech = JoyInsideSpeech(
+        bot_id=cfg.bot_id,
+        get_token=get_token,
+        use_agent=use_agent,
+        auto_interrupt_agent=not use_agent,
+    )
+    speech.connect(session_id=session_id)
+    speech.ensure_pcm_output()
 
-    def do_speak(reply_text: str) -> None:
-        if streaming:
-            speak_streaming(speech, reply_text, output_device=output_device)
-        else:
-            speak_batch(speech, helper, reply_text, output_device=output_device)
+    helper = SyncSpeechHelper(speech)
+    brain = ConversationBrain() if not use_agent else None
+
+    print("连接成功，可以开始对话。", flush=True)
+    print(f"会话 ID: {session_id[:8]}…", flush=True)
+    print_audio_devices(input_device, output_device)
 
     try:
         while True:
@@ -261,30 +285,30 @@ def run_chat(
             except EOFError:
                 break
 
-            if streaming:
-                print("正在听…（边录边传，说完稍等）")
-            else:
-                print("正在听…（对着麦克风说话，说完稍等）")
-
+            print("正在听…（边录边传，说完稍等）")
             try:
-                if streaming:
-                    user_text = recognize_streaming(
+                if use_agent:
+                    user_text, reply = agent_turn(
                         speech,
                         input_device=input_device,
+                        output_device=output_device,
                         silence_threshold=silence_threshold,
                     )
                 else:
-                    user_text = recognize_batch(
+                    user_text, reply = local_turn_streaming(
+                        speech,
                         helper,
+                        brain,
                         input_device=input_device,
+                        output_device=output_device,
                         silence_threshold=silence_threshold,
                     )
-            except TimeoutError:
-                print("识别超时，请重试")
+            except TimeoutError as exc:
+                print(f"{exc}，请重试")
                 continue
             except Exception as exc:
-                logger.error("录音/识别失败: %s", exc)
-                print(f"录音/识别失败: {exc}")
+                logger.error("对话失败: %s", exc)
+                print(f"对话失败: {exc}")
                 continue
 
             if not user_text:
@@ -294,17 +318,13 @@ def run_chat(
             print(f"你: {user_text}")
 
             if any(word in user_text for word in EXIT_WORDS):
-                reply = "好的，再见！"
-                print(f"机器人: {reply}")
-                do_speak(reply)
+                print("机器人: 好的，再见！")
                 break
 
-            reply = robot_brain(user_text)
-            print(f"机器人: {reply}")
-            try:
-                do_speak(reply)
-            except TimeoutError:
-                print("TTS 超时，请重试", flush=True)
+            if reply:
+                print(f"机器人: {reply}")
+            else:
+                print("机器人: （未收到文本回复，但可能已播放语音）")
 
     except KeyboardInterrupt:
         print("\n已退出对话")
@@ -313,7 +333,7 @@ def run_chat(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="JoyInside 语音对话（麦克风 + 耳机）")
+    parser = argparse.ArgumentParser(description="JoyInside 语音对话")
     parser.add_argument("--list-devices", action="store_true", help="列出音频设备")
     parser.add_argument("--input", dest="input_device", help="麦克风设备编号")
     parser.add_argument("--output", dest="output_device", help="播放设备编号")
@@ -324,9 +344,9 @@ def main() -> None:
         help="静音检测阈值（默认 0.015）",
     )
     parser.add_argument(
-        "--batch",
+        "--local",
         action="store_true",
-        help="使用批处理模式（录完再传、收完再播）",
+        help="使用本地大脑+纯TTS（不用 JoyInside 智能体）",
     )
     args = parser.parse_args()
 
@@ -338,7 +358,7 @@ def main() -> None:
         input_device=parse_device(args.input_device),
         output_device=parse_device(args.output_device),
         silence_threshold=args.silence_threshold,
-        streaming=not args.batch,
+        use_agent=not args.local,
     )
 
 

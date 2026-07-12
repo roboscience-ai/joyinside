@@ -1,9 +1,9 @@
 """
-JoyInside 语音客户端：仅使用 Token、ASR、TTS。
+JoyInside 语音客户端：Token、ASR、TTS，可选 JoyInside 智能体对话。
 
-通过 WebSocket 连接，不依赖智能体回复：
-- TTS: CLIENT_INPUT_TEXT_TO_SPEECH
-- ASR: 上传 AUDIO + CLIENT_AUDIO_FINISH，收到 ASR 后自动打断智能体
+- 纯 TTS: CLIENT_INPUT_TEXT_TO_SPEECH
+- ASR: 上传 AUDIO + CLIENT_AUDIO_FINISH
+- 智能体模式: 不打断，接收 AGENT 文本 + 平台 TTS
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 OnAsrFinal = Callable[[str], None]
 OnAsrPartial = Callable[[str], None]
+OnAgent = Callable[[str, dict[str, Any]], None]
 OnTtsAudio = Callable[[bytes, dict[str, Any]], None]
 OnTtsComplete = Callable[[], None]
 OnError = Callable[[Exception], None]
@@ -41,10 +42,12 @@ class JoyInsideSpeech:
     uid: str = ""
     on_asr_final: OnAsrFinal | None = None
     on_asr_partial: OnAsrPartial | None = None
+    on_agent: OnAgent | None = None
     on_tts_audio: OnTtsAudio | None = None
     on_tts_complete: OnTtsComplete | None = None
     on_error: OnError | None = None
     auto_interrupt_agent: bool = True
+    use_agent: bool = False
 
     _ws: websocket.WebSocketApp | None = field(default=None, init=False, repr=False)
     _thread: threading.Thread | None = field(default=None, init=False, repr=False)
@@ -53,9 +56,17 @@ class JoyInsideSpeech:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _asr_mode: bool = field(default=False, init=False)
     _asr_frame_index: int = field(default=0, init=False)
+    _session_id: str = field(default="", init=False)
+    _request_id: str = field(default="", init=False)
     _stop_ping: threading.Event = field(default_factory=threading.Event, init=False)
 
-    def connect(self, timeout: float = 15.0) -> None:
+    def connect(
+        self,
+        timeout: float = 15.0,
+        *,
+        session_id: str | None = None,
+        request_id: str | None = None,
+    ) -> None:
         if self._thread and self._thread.is_alive():
             return
 
@@ -63,8 +74,10 @@ class JoyInsideSpeech:
         self._config_ready.clear()
         self._stop_ping.clear()
 
-        session_id = str(uuid.uuid4())
-        request_id = str(uuid.uuid4())
+        session_id = session_id or str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
+        self._session_id = session_id
+        self._request_id = request_id
         params = [
             f"botId={self.bot_id}",
             f"sessionId={session_id}",
@@ -277,6 +290,7 @@ class JoyInsideSpeech:
                 text_type == "IS_FINAL"
                 and self._asr_mode
                 and self.auto_interrupt_agent
+                and not self.use_agent
             ):
                 self.interrupt()
 
@@ -301,7 +315,11 @@ class JoyInsideSpeech:
                 logger.error("%s", err)
 
         elif content_type == "AGENT":
-            logger.debug("忽略智能体文本: %s", content.get("content", ""))
+            text = content.get("content", "") or content.get("text", "")
+            if text:
+                logger.info("智能体: %s", text[:120])
+                if self.on_agent:
+                    self.on_agent(text, content)
 
         code = msg.get("code")
         if code not in (None, 200, "200"):
