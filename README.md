@@ -180,6 +180,56 @@ python voice_chat.py
 .\run_voice_chat.bat --input 1 --output 4
 ```
 
+### 4. 延迟测试
+
+运行基准脚本，测量 Token、WebSocket、ASR、TTS 各阶段耗时：
+
+```powershell
+# 完整测试
+python examples/latency_benchmark.py
+
+# 多轮取平均
+python examples/latency_benchmark.py --rounds 3
+
+# 用真人语音 PCM 测 ASR（推荐）
+python examples/latency_benchmark.py --pcm test_input.pcm
+
+# 只测 TTS
+python examples/latency_benchmark.py --skip-asr
+```
+
+**测量指标：**
+
+| 指标 | 含义 |
+|------|------|
+| Token 获取（冷/缓存） | 鉴权 HTTP 请求耗时 |
+| WebSocket 连接 | 建立语音通道耗时 |
+| PCM 音频配置 | 请求 TTS 下行 PCM 格式耗时 |
+| ASR 上传 | 按实时节奏发送音频（约等于录音时长） |
+| ASR 识别 | 上传完成 → 收到 `IS_FINAL` 识别结果 |
+| TTS 首包 (TTFB) | 发起合成 → 收到第一段音频 |
+| TTS 完成 | 发起合成 → 全部音频收完 |
+
+**参考延迟（国内网络，仅供参考，实际因网络和设备而异）：**
+
+| 指标 | 典型范围 |
+|------|----------|
+| Token 获取（冷启动） | 1.5–2.5 s |
+| WebSocket 连接 | 1.0–2.5 s |
+| PCM 配置 | 300–500 ms |
+| TTS 首包 (TTFB) | 500–800 ms |
+| TTS 完成（约 3s 语音） | 2.0–2.5 s |
+| ASR 识别（上传完成后） | 300–800 ms |
+
+**估算一轮对话延迟（不含录音和本地播放）：**
+
+```
+用户说完 → ASR 识别完成 → TTS 首包出声
+≈ ASR上传(≈录音时长) + ASR识别 + TTS首包
+```
+
+> ASR 测试需使用**真人说话的 PCM**（时长 > 1.5s）。用 TTS 合成音测 ASR 会超时或无结果。
+
 ---
 
 ## 五、集成到自己的程序
@@ -245,7 +295,8 @@ joyinside/
 └── examples/
     ├── register_device.py    # 注册设备
     ├── tts_demo.py           # TTS 测试
-    └── asr_demo.py           # ASR 测试
+    ├── asr_demo.py           # ASR 测试
+    └── latency_benchmark.py  # 延迟基准测试
 ```
 
 ---
