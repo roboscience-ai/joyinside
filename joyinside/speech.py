@@ -1,9 +1,11 @@
 """
-JoyInside 语音客户端：Token、ASR、TTS，可选 JoyInside 智能体对话。
+JoyInside 语音 WebSocket 客户端（对齐官方协议）。
 
-- 纯 TTS: CLIENT_INPUT_TEXT_TO_SPEECH
-- ASR: 上传 AUDIO + CLIENT_AUDIO_FINISH
-- 智能体模式: 不打断，接收 AGENT 文本 + 平台 TTS
+手动模式 (needManualCall=true):
+  流式上传 AUDIO → CLIENT_AUDIO_FINISH → 等待 ASR/Agent/TTS/COMPLETE
+
+官方一轮下行事件:
+  ASR → CALL_AGENT_START_EVENT → AGENT → TTS → TTS_COMPLETE → COMPLETE
 """
 
 from __future__ import annotations
@@ -27,9 +29,11 @@ logger = logging.getLogger(__name__)
 
 OnAsrFinal = Callable[[str], None]
 OnAsrPartial = Callable[[str], None]
+OnAgentStart = Callable[[str, dict[str, Any]], None]
 OnAgent = Callable[[str, dict[str, Any]], None]
 OnTtsAudio = Callable[[bytes, dict[str, Any]], None]
-OnTtsComplete = Callable[[], None]
+OnRoundComplete = Callable[[], None]
+OnAgentInterrupted = Callable[[], None]
 OnError = Callable[[Exception], None]
 
 
@@ -42,9 +46,11 @@ class JoyInsideSpeech:
     uid: str = ""
     on_asr_final: OnAsrFinal | None = None
     on_asr_partial: OnAsrPartial | None = None
+    on_agent_start: OnAgentStart | None = None
     on_agent: OnAgent | None = None
     on_tts_audio: OnTtsAudio | None = None
-    on_tts_complete: OnTtsComplete | None = None
+    on_round_complete: OnRoundComplete | None = None
+    on_agent_interrupted: OnAgentInterrupted | None = None
     on_error: OnError | None = None
     auto_interrupt_agent: bool = True
     use_agent: bool = False
@@ -56,8 +62,7 @@ class JoyInsideSpeech:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _asr_mode: bool = field(default=False, init=False)
     _asr_frame_index: int = field(default=0, init=False)
-    _session_id: str = field(default="", init=False)
-    _request_id: str = field(default="", init=False)
+    _audio_configured: bool = field(default=False, init=False)
     _stop_ping: threading.Event = field(default_factory=threading.Event, init=False)
 
     def connect(
@@ -73,11 +78,10 @@ class JoyInsideSpeech:
         self._connected.clear()
         self._config_ready.clear()
         self._stop_ping.clear()
+        self._audio_configured = False
 
         session_id = session_id or str(uuid.uuid4())
         request_id = request_id or str(uuid.uuid4())
-        self._session_id = session_id
-        self._request_id = request_id
         params = [
             f"botId={self.bot_id}",
             f"sessionId={session_id}",
@@ -112,11 +116,29 @@ class JoyInsideSpeech:
         self._stop_ping.set()
         if self._ws:
             self._ws.close()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+        self._ws = None
         self._connected.clear()
         self._config_ready.clear()
+        self._audio_configured = False
 
     def wait_connected(self, timeout: float = 15.0) -> bool:
         return self._connected.wait(timeout)
+
+    def ensure_pcm_output(self, sample_rate: str = "16000", timeout: float = 10.0) -> None:
+        """连接后仅发送一次 CLIENT_VOICE_CHAT_UPDATE（官方要求）。"""
+        if self._audio_configured:
+            return
+        self.update_audio_config(
+            output_codec="pcm",
+            output_sample_rate=sample_rate,
+            output_frame_size_ms="60",
+            wait=True,
+            timeout=timeout,
+        )
+        self._audio_configured = True
 
     def update_audio_config(
         self,
@@ -133,14 +155,8 @@ class JoyInsideSpeech:
         event_data: dict[str, Any] = {
             "audio": {
                 "binary": binary,
-                "input": {
-                    "codec": input_codec,
-                    "sampleRate": input_sample_rate,
-                },
-                "output": {
-                    "codec": output_codec,
-                    "sampleRate": output_sample_rate,
-                },
+                "input": {"codec": input_codec, "sampleRate": input_sample_rate},
+                "output": {"codec": output_codec, "sampleRate": output_sample_rate},
             }
         }
         if output_frame_size_ms:
@@ -150,50 +166,56 @@ class JoyInsideSpeech:
         self._send_event("CLIENT_VOICE_CHAT_UPDATE", event_data)
 
         if wait and not self._config_ready.wait(timeout):
-            logger.warning("等待 SERVER_VOICE_CHAT_UPDATED 超时，继续使用默认音频配置")
-
-    def ensure_pcm_output(self, sample_rate: str = "16000", timeout: float = 10.0) -> None:
-        """请求 TTS 下行使用 PCM（默认可能是 MP3，直接当 PCM 播放会变成杂音）。"""
-        self.update_audio_config(
-            output_codec="pcm",
-            output_sample_rate=sample_rate,
-            wait=True,
-            timeout=timeout,
-        )
+            logger.warning("等待 SERVER_VOICE_CHAT_UPDATED 超时")
 
     def speak(self, text: str) -> None:
-        """纯 TTS，不触发智能体。"""
         self._asr_mode = False
-        self._send_event(
-            "CLIENT_INPUT_TEXT_TO_SPEECH",
-            {"text": text},
-        )
+        self._send_event("CLIENT_INPUT_TEXT_TO_SPEECH", {"text": text})
+
+    def send_text(self, text: str) -> None:
+        """发送文本触发智能体（官方 contentType=TEXT，不经过音频链路）。"""
+        self._asr_mode = False
+        payload: dict[str, Any] = {
+            "mid": str(uuid.uuid4()),
+            "contentType": "TEXT",
+            "content": {"input": text},
+        }
+        if self.uid:
+            payload["uid"] = self.uid
+        self._send_json(payload)
 
     def begin_asr(self) -> None:
-        """开始流式 ASR 会话。"""
         self._asr_mode = True
         self._asr_frame_index = 0
 
-    def stream_asr_chunk(self, chunk: bytes, *, is_last: bool = False) -> None:
-        """流式上传单帧 ASR 音频（边录边传，无需额外 sleep）。"""
+    def stream_asr_chunk(
+        self,
+        chunk: bytes,
+        *,
+        is_last: bool = False,
+        pace: bool = False,
+    ) -> None:
+        """上传一帧音频。pace=True 时按帧时长 sleep（仅用于回放 PCM 文件）。"""
         from config import BYTES_PER_FRAME
 
-        if not chunk:
+        if not chunk and not is_last:
             return
+
         frame_size = BYTES_PER_FRAME
-        index = self._asr_frame_index
-        is_partial_last = is_last and len(chunk) < frame_size
-        send_index = ~index if is_partial_last else index
-        self._send_audio(chunk, index=send_index)
-        self._asr_frame_index += 1
+        if chunk:
+            index = self._asr_frame_index
+            is_partial_last = is_last and len(chunk) < frame_size
+            send_index = ~index if is_partial_last else index
+            self._send_audio(chunk, index=send_index)
+            self._asr_frame_index += 1
+            if pace and not is_last:
+                time.sleep(frame_duration_seconds(len(chunk)))
 
     def finish_asr(self) -> None:
-        """结束流式 ASR 上传。"""
         if self.manual_mode:
             self._send_event("CLIENT_AUDIO_FINISH")
 
     def recognize_pcm(self, pcm_chunks: list[bytes], *, frame_bytes: int | None = None) -> None:
-        """上传 PCM 帧进行 ASR（手动模式需配合 CLIENT_AUDIO_FINISH）。"""
         from config import BYTES_PER_FRAME
 
         frame_size = frame_bytes or BYTES_PER_FRAME
@@ -233,11 +255,7 @@ class JoyInsideSpeech:
         content: dict[str, Any] = {"eventType": event_type}
         if event_data is not None:
             content["eventData"] = event_data
-        payload = {
-            "mid": str(uuid.uuid4()),
-            "contentType": "EVENT",
-            "content": content,
-        }
+        payload = {"mid": str(uuid.uuid4()), "contentType": "EVENT", "content": content}
         if self.uid:
             payload["uid"] = self.uid
         self._send_json(payload)
@@ -256,10 +274,7 @@ class JoyInsideSpeech:
     def _ping_loop(self) -> None:
         while not self._stop_ping.is_set() and self._connected.is_set():
             try:
-                payload = {
-                    "mid": str(uuid.uuid4()),
-                    "contentType": "PING",
-                }
+                payload = {"mid": str(uuid.uuid4()), "contentType": "PING"}
                 if self.uid:
                     payload["uid"] = self.uid
                 self._send_json(payload)
@@ -304,10 +319,27 @@ class JoyInsideSpeech:
             if event_type == "SERVER_VOICE_CHAT_UPDATED":
                 self._config_ready.set()
                 logger.info("音频配置已更新")
-            elif event_type == "TTS_COMPLETE" and self.on_tts_complete:
-                self.on_tts_complete()
+            elif event_type == "CALL_AGENT_START_EVENT":
+                input_text = (content.get("eventData") or {}).get("input", "")
+                logger.info("智能体开始: %s", input_text)
+                if self.on_agent_start:
+                    self.on_agent_start(input_text, content)
+            elif event_type == "TTS_COMPLETE":
+                logger.debug("TTS 完成")
+                if self.on_round_complete and not self.use_agent:
+                    self.on_round_complete()
+            elif event_type == "COMPLETE":
+                logger.info("当轮对话完成")
+                if self.on_round_complete:
+                    self.on_round_complete()
+            elif event_type == "EMPTY_CONTENT":
+                logger.info("未识别到有效内容")
+                if self.on_round_complete:
+                    self.on_round_complete()
             elif event_type == "CALL_AGENT_INTERRUPTED":
-                logger.debug("已打断智能体输出")
+                logger.info("智能体被打断")
+                if self.on_agent_interrupted:
+                    self.on_agent_interrupted()
             elif event_type == "REPEAT_CLIENT_SESSION":
                 err = RuntimeError("同一 botId 存在重复 WebSocket 连接")
                 if self.on_error:
@@ -317,7 +349,7 @@ class JoyInsideSpeech:
         elif content_type == "AGENT":
             text = content.get("content", "") or content.get("text", "")
             if text:
-                logger.info("智能体: %s", text[:120])
+                logger.debug("智能体: %s", text[:120])
                 if self.on_agent:
                     self.on_agent(text, content)
 
@@ -342,7 +374,7 @@ class JoyInsideSpeech:
 
 
 class SyncSpeechHelper:
-    """在回调模式下提供同步阻塞调用。"""
+    """回调模式下的同步阻塞调用。"""
 
     def __init__(self, speech: JoyInsideSpeech) -> None:
         self.speech = speech
@@ -358,9 +390,9 @@ class SyncSpeechHelper:
             done.set()
 
         prev_audio = self.speech.on_tts_audio
-        prev_complete = self.speech.on_tts_complete
+        prev_complete = self.speech.on_round_complete
         self.speech.on_tts_audio = on_audio
-        self.speech.on_tts_complete = on_complete
+        self.speech.on_round_complete = on_complete
 
         try:
             self.speech.speak(text)
@@ -369,7 +401,7 @@ class SyncSpeechHelper:
             return b"".join(chunks)
         finally:
             self.speech.on_tts_audio = prev_audio
-            self.speech.on_tts_complete = prev_complete
+            self.speech.on_round_complete = prev_complete
 
     def recognize_and_wait(self, pcm_chunks: list[bytes], timeout: float = 30.0) -> str:
         result: dict[str, str] = {}

@@ -239,11 +239,8 @@ def measure_asr_streaming(speech: JoyInsideSpeech, pcm_data: bytes) -> tuple[flo
             if first_sent_at == 0.0:
                 first_sent_at = time.perf_counter()
             is_last = i == len(chunks) - 1
-            speech.stream_asr_chunk(chunk, is_last=is_last)
+            speech.stream_asr_chunk(chunk, is_last=is_last, pace=True)
             last_sent_at = time.perf_counter()
-            # 模拟边录边传：每帧间隔与帧时长一致
-            if not is_last:
-                time.sleep(frame_duration_seconds(len(chunk)))
 
         speech.finish_asr()
         upload_ms = (last_sent_at - first_sent_at) * 1000 if first_sent_at else 0.0
@@ -277,9 +274,9 @@ def measure_tts(speech: JoyInsideSpeech, text: str) -> tuple[float, float, int, 
         done.set()
 
     prev_audio = speech.on_tts_audio
-    prev_complete = speech.on_tts_complete
+    prev_complete = speech.on_round_complete
     speech.on_tts_audio = on_audio
-    speech.on_tts_complete = on_complete
+    speech.on_round_complete = on_complete
 
     try:
         speech.speak(text)
@@ -293,7 +290,7 @@ def measure_tts(speech: JoyInsideSpeech, text: str) -> tuple[float, float, int, 
         return first_ms, complete_ms, len(audio), duration_s
     finally:
         speech.on_tts_audio = prev_audio
-        speech.on_tts_complete = prev_complete
+        speech.on_round_complete = prev_complete
 
 
 def run_round(
