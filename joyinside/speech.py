@@ -1,6 +1,9 @@
 """
 JoyInside 语音 WebSocket 客户端（对齐官方协议）。
 
+自由模式 (manual_mode=False，官方 RK demo 默认):
+  持续上行 AUDIO，不发 CLIENT_AUDIO_FINISH；云端 VAD 切句后自动 ASR→Agent→TTS
+
 手动模式 (needManualCall=true):
   流式上传 AUDIO → CLIENT_AUDIO_FINISH → 等待 ASR/Agent/TTS/COMPLETE
 
@@ -41,7 +44,7 @@ OnError = Callable[[Exception], None]
 class JoyInsideSpeech:
     bot_id: str
     get_token: Callable[[], str]
-    manual_mode: bool = True
+    manual_mode: bool = False
     ping_interval: float = 30.0
     uid: str = ""
     on_asr_final: OnAsrFinal | None = None

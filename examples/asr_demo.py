@@ -30,7 +30,7 @@ def main() -> None:
     def get_token() -> str:
         return auth.get_token(bot_id=cfg.bot_id)
 
-    speech = JoyInsideSpeech(bot_id=cfg.bot_id, get_token=get_token)
+    speech = JoyInsideSpeech(bot_id=cfg.bot_id, get_token=get_token, manual_mode=True)
     speech.connect()
 
     pcm_data = read_pcm_file(pcm_path)

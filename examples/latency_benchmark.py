@@ -318,6 +318,7 @@ def run_round(
     speech = JoyInsideSpeech(
         bot_id=cfg.bot_id,
         get_token=lambda: auth.get_token(bot_id=cfg.bot_id),
+        manual_mode=True,
     )
 
     t0 = time.perf_counter()
